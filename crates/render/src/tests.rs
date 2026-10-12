@@ -521,3 +521,33 @@ fn a_reversed_clip_shows_exactly_its_source_range() {
     let all: Vec<i64> = (0..20).flat_map(|f| shown(&p, f, false)).collect();
     assert_eq!(all, (10..=29).rev().collect::<Vec<_>>());
 }
+
+#[test]
+fn cpu_effect_followed_by_gpu_effect_keeps_gpu_suffix() {
+    let (mut project, _red, ocean, seq, sources) = setup();
+    let clip = place(&mut project, seq, 0, ocean, 0, 48);
+    {
+        let sequence = project.sequence_mut(seq).unwrap();
+        let (_, item) = sequence.find_item_mut(clip).unwrap();
+        // The first GPU-compatible effect is evaluated on the CPU because it
+        // precedes a CPU-only effect; the GPU still executes the final run.
+        let first = filmcraft_project::find_effect("invert").unwrap().instance();
+        item.effects.push(first);
+        let mut cpu = filmcraft_project::find_effect("mosaic").unwrap().instance();
+        cpu.params.get_mut("horizontal_blocks").map(|p| p.value = ParamValue::Float(24.0));
+        item.effects.push(cpu);
+        let mut gpu = filmcraft_project::find_effect("brightness_contrast").unwrap().instance();
+        gpu.params.get_mut("brightness").unwrap().value = ParamValue::Float(30.0);
+        item.effects.push(gpu);
+    }
+    let options = RenderOptions::default();
+    let t = FrameRate::FPS_24.tick_of(5);
+    let plan = plan::plan_frame(&project, seq, t, options, &sources);
+    let plan::FramePlan::Layers { layers, .. } = &plan else { panic!("expected layers") };
+    assert!(layers.iter().any(|layer| layer.fx.as_ref().is_some_and(|fx| !fx.ops.is_empty())), "GPU suffix was lost");
+    let actual = plan::execute_cpu(&plan);
+    let expected = render_sequence(&project, seq, t, options, &sources);
+    assert_eq!((actual.w, actual.h), (expected.w, expected.h));
+    let max = actual.px.iter().zip(&expected.px).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert!(max < 0.02, "CPU/GPU suffix differs from reference: {max}");
+}

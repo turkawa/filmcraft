@@ -185,6 +185,7 @@ impl Pipeline {
                     break;
                 }
             }
+            eprintln!("[filmcraft-export] GPU frame renderers initialized: {}/{} requested", list.len(), count);
             RendererPool::new(list)
         };
         Ok(Pipeline {

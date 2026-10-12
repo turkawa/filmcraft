@@ -13,7 +13,7 @@
 
 use crate::{GpuCompositor, prepare};
 use filmcraft_project::{ItemId, Project};
-use filmcraft_render::plan::{FramePlan, plan_frame};
+use filmcraft_render::plan::{FramePlan, plan_frame_with_gpu, LayerFx};
 use filmcraft_render::{Image, RenderOptions, SourceProvider};
 use filmcraft_time::Tick;
 
@@ -109,11 +109,27 @@ impl ExportRenderer {
                 // alone: this crate asks for none) has no GPU to offer, and `Instance::default()`
                 // panics there.
                 if wgpu::Instance::enabled_backend_features().is_empty() {
+                    eprintln!("[filmcraft-gpu] no wgpu backends enabled in this build");
                     return None;
                 }
                 let instance = wgpu::Instance::default();
-                let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
-                let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()?;
+                let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) {
+                    Ok(adapter) => adapter,
+                    Err(error) => {
+                        eprintln!("[filmcraft-gpu] adapter request failed: {error}");
+                        return None;
+                    }
+                };
+                let info = adapter.get_info();
+                eprintln!("[filmcraft-gpu] selected adapter: {} | type: {:?} | backend: {:?} | device: {}",
+                    info.name, info.device_type, info.backend, info.device);
+                let (device, queue) = match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())) {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        eprintln!("[filmcraft-gpu] device request failed for {}: {error}", info.name);
+                        return None;
+                    }
+                };
                 // wgpu's default handler panics on a validation or out-of-memory error; log it and
                 // send the remaining frames to the CPU instead.
                 device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| mark_device_failed(&format!("GPU error: {e}"))));
@@ -132,7 +148,14 @@ impl ExportRenderer {
     /// One frame as `render_sequence` would return it (premultiplied linear-light RGBA at the
     /// render size), or `None` when this frame must go to the CPU renderer.
     pub fn render(&mut self, project: &Project, seq: ItemId, t: Tick, opts: RenderOptions, sources: &dyn SourceProvider) -> Option<Image> {
-        let plan = plan_frame(project, seq, t, opts, sources);
+        let compositor = &mut self.compositor;
+        let mut run = |image: &Image, ops: &[filmcraft_render::gpufx::FxOp]| -> Option<Image> {
+            let fx = LayerFx { size: (image.w as u32, image.h as u32), decimation: 1, ops: ops.to_vec() };
+            let frame = filmcraft_frame::VideoFrame::rgba_f32(image.w as u32, image.h as u32, image.px.clone());
+            let (w, h, px) = compositor.effect_image(&frame, &fx)?;
+            Some(Image { w: w as usize, h: h as usize, px })
+        };
+        let plan = plan_frame_with_gpu(project, seq, t, opts, sources, Some(&mut run));
         match &plan {
             // Already the CPU image: return it unchanged instead of rendering it twice.
             FramePlan::Image(img) => Some(img.clone()),
@@ -283,6 +306,62 @@ mod tests {
         let cpu = filmcraft_render::render_sequence(&p, seq, t, RenderOptions::default(), &m);
         let gpu = r.render(&p, seq, t, RenderOptions::default(), &m).expect("GPU rendered the frame");
         assert_parity(&cpu, &gpu, "transformed");
+    }
+
+    #[test]
+    fn mixed_gpu_cpu_gpu_export_matches_cpu() {
+        let Some(mut renderer) = ExportRenderer::new() else {
+            eprintln!("SKIPPED (mixed GPU/CPU/GPU): no GPU adapter");
+            return;
+        };
+        let (p, seq, sources) = project(false);
+        let mut p = (*p).clone();
+        let video_id = p.items.iter()
+            .find(|(_, item)| matches!(item.kind, filmcraft_project::ItemKind::Media(_)))
+            .map(|(id, _)| *id)
+            .unwrap();
+        let rate = filmcraft_time::FrameRate::FPS_24;
+        let clip = p.make_track_item(
+            video_id,
+            filmcraft_project::TrackKind::Video,
+            filmcraft_time::Tick::ZERO,
+            filmcraft_time::TimeRange::new(filmcraft_time::Tick::ZERO, rate.tick_of(24)),
+            rate,
+        ).unwrap();
+        p.sequence_mut(seq).unwrap().video_tracks[0].items.push(clip);
+        {
+            let clip = p.sequence_mut(seq).unwrap().video_tracks[0].items.first_mut().unwrap();
+            // GPU-capable prefix, CPU-only middle, GPU-capable suffix.
+            clip.effects.push(filmcraft_project::find_effect("invert").unwrap().instance());
+            let mut middle = filmcraft_project::find_effect("mosaic").unwrap().instance();
+            middle.params.get_mut("horizontal").unwrap().value = filmcraft_project::ParamValue::Float(24.0);
+            clip.effects.push(middle);
+            let mut suffix = filmcraft_project::find_effect("brightness_contrast").unwrap().instance();
+            suffix.params.get_mut("brightness").unwrap().value = filmcraft_project::ParamValue::Float(30.0);
+            clip.effects.push(suffix);
+        }
+        let t = filmcraft_time::FrameRate::FPS_24.tick_of(5);
+        let opts = RenderOptions::default();
+
+        // Prove the GPU prefix was actually submitted and read back, and that
+        // the final GPU suffix is still scheduled for the compositor.
+        let mut gpu_runs = 0usize;
+        let mut execute = |image: &Image, ops: &[filmcraft_render::gpufx::FxOp]| -> Option<Image> {
+            let fx = LayerFx { size: (image.w as u32, image.h as u32), decimation: 1, ops: ops.to_vec() };
+            let frame = filmcraft_frame::VideoFrame::rgba_f32(image.w as u32, image.h as u32, image.px.clone());
+            let (w, h, px) = renderer.compositor.effect_image(&frame, &fx)?;
+            gpu_runs += 1;
+            Some(Image { w: w as usize, h: h as usize, px })
+        };
+        let plan = plan_frame_with_gpu(&p, seq, t, opts, &sources, Some(&mut execute));
+        assert_eq!(gpu_runs, 1, "expected one real GPU-to-CPU readback before the CPU effect");
+        let FramePlan::Layers { layers, .. } = &plan else { panic!("expected GPU compositing plan") };
+        assert!(layers.iter().any(|layer| layer.fx.as_ref().is_some_and(|fx| !fx.ops.is_empty())),
+            "GPU suffix was not scheduled");
+
+        let cpu = filmcraft_render::render_sequence(&p, seq, t, opts, &sources);
+        let gpu = renderer.render(&p, seq, t, opts, &sources).expect("hybrid GPU export failed");
+        assert_parity(&cpu, &gpu, "GPU -> CPU -> GPU export");
     }
 
     #[test]

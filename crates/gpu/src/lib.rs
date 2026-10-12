@@ -1098,10 +1098,13 @@ impl GpuCompositor {
         let mut out = filmcraft_frame::pool::take_f32_overwritten(width.checked_mul(h as usize)?.checked_mul(4)?);
         let data = slice.get_mapped_range().ok()?;
         // every row must be there: the pooled output holds stale values until written
-        let converted = out.chunks_exact_mut(width * 4).enumerate().all(|(y, dst)| {
+        // The mapped staging buffer is read-only here; convert independent rows in parallel.
+        // At 1080p this is over eight million half-float values per frame, so a serial loop
+        // leaves CPU cores idle while the export workers wait for conversion to finish.
+        let converted = out.par_chunks_mut(width * 4).enumerate().all(|(y, dst)| {
             let Some(src) = data.get(y * row..y * row + width * 8) else { return false };
             for (d, s) in dst.iter_mut().zip(src.as_chunks::<2>().0) {
-                *d = f16_to_f32_fast(u16::from_le_bytes(*s));
+                *d = half::f16::from_bits(u16::from_le_bytes(*s)).to_f32();
             }
             true
         });

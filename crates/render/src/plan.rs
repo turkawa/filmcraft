@@ -166,9 +166,10 @@ fn simple_transition(id: &str) -> bool {
     matches!(id, "cross_dissolve" | "dip_to_black" | "dip_to_white")
 }
 
-/// The standard effects of a media clip if the GPU can draw it (any blend mode, no opacity masks,
-/// every enabled standard effect unmasked and with a GPU implementation; empty without effects or
-/// with effects off). None: the clip is rendered on the CPU.
+/// Enabled standard effects of a media clip, in source order. A GPU-incompatible
+/// effect no longer rejects the entire chain: a GPU-capable suffix can still run
+/// after the CPU has evaluated the preceding effects with their full environment.
+/// None means the clip itself requires the original CPU rendering path.
 fn gpu_chain<'a>(project: &Project, item: &'a TrackItem, opts: RenderOptions) -> Option<Vec<&'a filmcraft_project::EffectInstance>> {
     let is_media = project.item(item.item).is_some_and(|p| matches!(p.kind, ItemKind::Media(_) | ItemKind::Subclip { .. }));
     if !is_media || item.has_opacity_masks() {
@@ -182,24 +183,33 @@ fn gpu_chain<'a>(project: &Project, item: &'a TrackItem, opts: RenderOptions) ->
         if !e.enabled {
             continue;
         }
-        let masked = e.masks.iter().any(|m| m.mode != filmcraft_project::MaskMode::None);
-        if masked || !crate::gpufx::GPU_EFFECTS.contains(&e.effect.as_str()) {
-            return None;
-        }
         chain.push(e);
     }
     Some(chain)
 }
 
+/// Optional GPU execution at CPU/GPU boundaries. The callback receives an already
+/// decoded linear working image and a contiguous run of evaluated GPU operations.
+/// Returning None keeps the reference CPU execution path available.
+pub type GpuEffectRun<'a> = dyn FnMut(&crate::Image, &[FxOp]) -> Option<crate::Image> + 'a;
+
 /// Plan the frame at timeline `t`.
 pub fn plan_frame(project: &Project, seq_id: ItemId, t: Tick, opts: RenderOptions, sources: &dyn SourceProvider) -> FramePlan {
+    plan_frame_with_gpu(project, seq_id, t, opts, sources, None)
+}
+
+/// Plan with optional GPU execution of effect runs before a CPU effect boundary.
+pub fn plan_frame_with_gpu(
+    project: &Project, seq_id: ItemId, t: Tick, opts: RenderOptions,
+    sources: &dyn SourceProvider, mut gpu: Option<&mut GpuEffectRun<'_>>,
+) -> FramePlan {
     let Some(seq) = project.sequence(seq_id) else { return FramePlan::Image(crate::Image::new(1, 1)) };
     let (w, h) = output_size(seq, opts.scale);
     if whole_frame_on_cpu(project, seq, t) {
         return FramePlan::Image(crate::render_sequence(project, seq_id, t, opts, sources));
     }
     let mut layers = PlanStack::default();
-    push_tracks(project, seq, t, opts, sources, 0, &mut layers);
+    push_tracks(project, seq, t, opts, sources, 0, &mut layers, &mut gpu);
     if opts.captions {
         for o in crate::caption_overlays(seq, t, w, h) {
             layers.push(PlanLayer::new(
@@ -251,7 +261,7 @@ fn layered_at(project: &Project, seq: &Sequence, t: Tick) -> bool {
 
 /// Push the layers of every video track of `seq` at `t`, bottom track first (`seq` must be
 /// [`layered_at`] `t`). `nest` counts the nested sequences already followed to reach `seq`.
-fn push_tracks(project: &Project, seq: &Sequence, t: Tick, opts: RenderOptions, sources: &dyn SourceProvider, nest: u32, layers: &mut PlanStack) {
+fn push_tracks(project: &Project, seq: &Sequence, t: Tick, opts: RenderOptions, sources: &dyn SourceProvider, nest: u32, layers: &mut PlanStack, gpu: &mut Option<&mut GpuEffectRun<'_>>) {
     let (w, h) = output_size(seq, opts.scale);
     for tr in &seq.video_tracks {
         if !tr.enabled {
@@ -268,7 +278,7 @@ fn push_tracks(project: &Project, seq: &Sequence, t: Tick, opts: RenderOptions, 
                     for (slot, item) in inputs.iter_mut().zip([a, b]) {
                         if let Some(item) = item {
                             let mut input = PlanStack::default();
-                            push_item(project, seq, item, t, opts, sources, 1.0, Some(Blend::Normal), nest, &mut input);
+                            push_item(project, seq, item, t, opts, sources, 1.0, Some(Blend::Normal), nest, &mut input, gpu);
                             *slot = input.into_layers(w, h);
                         }
                     }
@@ -285,16 +295,16 @@ fn push_tracks(project: &Project, seq: &Sequence, t: Tick, opts: RenderOptions, 
                     layers.push(PlanLayer::new(Arc::new(VideoFrame::rgba_f32(1, 1, col.to_vec())), Affine::scale(w as f64, h as f64), 1.0, Blend::Normal));
                     let (it, k) = if p < 0.5 { (a, 1.0 - p * 2.0) } else { (b, (p - 0.5) * 2.0) };
                     if let Some(it) = it {
-                        push_item(project, seq, it, t, opts, sources, k, Some(Blend::Normal), nest, layers);
+                        push_item(project, seq, it, t, opts, sources, k, Some(Blend::Normal), nest, layers, gpu);
                     }
                 }
                 _ => {
                     // cross dissolve: A at full, B over it at p (premultiplied over == linear mix when A is opaque)
                     if let Some(it) = a {
-                        push_item(project, seq, it, t, opts, sources, 1.0 - if b.is_none() { p } else { 0.0 }, Some(Blend::Normal), nest, layers);
+                        push_item(project, seq, it, t, opts, sources, 1.0 - if b.is_none() { p } else { 0.0 }, Some(Blend::Normal), nest, layers, gpu);
                     }
                     if let Some(it) = b {
-                        push_item(project, seq, it, t, opts, sources, p, Some(Blend::Normal), nest, layers);
+                        push_item(project, seq, it, t, opts, sources, p, Some(Blend::Normal), nest, layers, gpu);
                     }
                 }
             }
@@ -304,7 +314,7 @@ fn push_tracks(project: &Project, seq: &Sequence, t: Tick, opts: RenderOptions, 
         if !item.enabled {
             continue;
         }
-        push_item(project, seq, item, t, opts, sources, 1.0, None, nest, layers);
+        push_item(project, seq, item, t, opts, sources, 1.0, None, nest, layers, gpu);
     }
 }
 
@@ -340,6 +350,7 @@ fn push_item(
     blend: Option<Blend>,
     nest: u32,
     out: &mut PlanStack,
+    gpu: &mut Option<&mut GpuEffectRun<'_>>,
 ) {
     // frame time (`ft`) vs. effect time (`mt`): they differ inside a frame hold without Hold Filters
     let ft = item.source_time_at(t);
@@ -361,7 +372,7 @@ fn push_item(
         // Inside the nested sequence the angle's clip is composited onto an empty canvas, where
         // every mode but Dissolve is Normal; the multicam clip's own mode then applies to it.
         if let Some(inner) = tr.item_at(ft).filter(|i| i.enabled) {
-            push_item(project, nested, inner, ft, opts, sources, extra_opacity * op, Some(bl), nest + 1, out);
+            push_item(project, nested, inner, ft, opts, sources, extra_opacity * op, Some(bl), nest + 1, out, gpu);
         }
         return;
     }
@@ -378,7 +389,7 @@ fn push_item(
         && near_identity(&motion_matrix(seq, item, (nested.settings.width, nested.settings.height), Some(nested.settings.par), mt))
         && nest_is_plain(project, seq, nested, ft)
     {
-        push_tracks(project, nested, ft, opts, sources, nest + 1, out);
+        push_tracks(project, nested, ft, opts, sources, nest + 1, out, gpu);
         let (w, h) = output_size(nested, opts.scale);
         for o in crate::caption_overlays(nested, ft, w, h) {
             out.push(PlanLayer::new(
@@ -436,7 +447,89 @@ fn push_item(
                 env: None,
                 working: seq.settings.color.working,
             };
-            let ops: Option<Vec<FxOp>> = chain.iter().map(|e| FxOp::eval(e, &cx, lw, lh).filter(FxOp::gpu_ok)).collect();
+            // Classify by the *evaluated* GPU operation, not by effect name alone.
+            // Effects with masks remain CPU effects. Retain the GPU suffix after the
+            // last CPU effect; the CPU prefix is evaluated with the complete FxEnv.
+            let evaluated: Vec<Option<FxOp>> = chain
+                .iter()
+                .map(|e| {
+                    if e.masks.iter().any(|m| m.mode != filmcraft_project::MaskMode::None) {
+                        None
+                    } else {
+                        FxOp::eval(e, &cx, lw, lh).filter(FxOp::gpu_ok)
+                    }
+                })
+                .collect();
+            let last_cpu = evaluated.iter().rposition(Option::is_none);
+            if let Some(cut) = last_cpu {
+                // CPU effects require ItemEnv, which is only available here. Execute
+                // preceding GPU runs at their boundaries, retaining the original order.
+                if let Some(mut image) = crate::base_layer(project, seq, item, t, opts, sources, want) {
+                    let scale = image.w as f32 / size.0.max(1) as f32;
+                    let matrix = Affine::scale(opts.scale as f64, opts.scale as f64)
+                        .then_apply(&motion)
+                        .then_apply(&Affine::scale(1.0 / scale as f64, 1.0 / scale as f64));
+                    let timecode = filmcraft_time::format_time(
+                        t, seq.settings.frame_rate, seq.settings.drop_frame,
+                        filmcraft_time::TimeDisplay::Timecode, 48_000,
+                    );
+                    let env = crate::vfx::ItemEnv {
+                        project, seq, item, t, opts, sources, want,
+                        layer_size: (image.w, image.h), layer_to_output: matrix,
+                        tc: &timecode,
+                    };
+                    let context = crate::effects::FxCtx {
+                        t: mt, px_scale: scale, seconds: (t - item.start).seconds(),
+                        timecode: &timecode, clip_name: &item.name, project: Some(project),
+                        env: Some(&env), working: seq.settings.color.working,
+                    };
+                    let mut index = 0;
+                    while index <= cut {
+                        if filmcraft_media::cancel::cancelled() { return; }
+                        let candidate = &chain[index];
+                        let op = if candidate.masks.iter().all(|m| m.mode == filmcraft_project::MaskMode::None) {
+                            FxOp::eval(candidate, &context, image.w, image.h).filter(FxOp::gpu_ok)
+                        } else { None };
+                        if let Some(first) = op {
+                            let mut ops = vec![first];
+                            let mut next = index + 1;
+                            while next <= cut {
+                                let e = chain[next];
+                                let op = if e.masks.iter().all(|m| m.mode == filmcraft_project::MaskMode::None) {
+                                    FxOp::eval(e, &context, image.w, image.h).filter(FxOp::gpu_ok)
+                                } else { None };
+                                if let Some(op) = op { ops.push(op); next += 1; } else { break; }
+                            }
+                            let accelerated = gpu.as_deref_mut().and_then(|run| run(&image, &ops));
+                            if let Some(result) = accelerated.filter(|result| result.w == image.w && result.h == image.h) {
+                                image = result;
+                            } else {
+                                for op in &ops { op.apply(&mut image); }
+                            }
+                            index = next;
+                        } else {
+                            crate::mask::apply_effect(&mut image, candidate, &context);
+                            index += 1;
+                        }
+                    }
+                    // Leave the final contiguous GPU suffix on the compositor, without
+                    // an extra readback. A CPU-only tail has no GPU stage to schedule.
+                    let tail: Option<Vec<FxOp>> = chain[cut + 1..].iter().map(|e| {
+                        FxOp::eval(e, &context, image.w, image.h).filter(FxOp::gpu_ok)
+                    }).collect();
+                    if let Some(ops) = tail {
+                        let fx = if ops.is_empty() { None } else {
+                            Some(Arc::new(LayerFx { size: (image.w as u32, image.h as u32), decimation: 1, ops }))
+                        };
+                        out.push(PlanLayer {
+                            frame: cpu_frame(image), matrix, opacity: op * extra_opacity,
+                            blend: bl, fx, input: None,
+                        });
+                        return;
+                    }
+                }
+            }
+            let ops: Option<Vec<FxOp>> = evaluated.into_iter().collect();
             if let Some(ops) = ops {
                 let m = Affine::scale(opts.scale as f64, opts.scale as f64)
                     .then_apply(&motion)

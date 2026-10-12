@@ -439,6 +439,7 @@ async fn cli() {
                 p["gpuRendering"] = json!(v); // off | auto (validated by the export command)
             }
             let mut b = Backend::open(&a);
+            filmcraft_gpu::export_renderer::timing::reset();
             let t0 = std::time::Instant::now();
             let r = if a.flag("--queue") {
                 let mut q = p.clone();
@@ -455,6 +456,12 @@ async fn cli() {
                     print(&a, &v);
                     let written = written_paths(&v, out).join(", ");
                     check_offline(&a, &offline_media(&v), &format!("export: {written}"));
+                    let renderer = filmcraft_export::gpu_render_stats();
+                    let gpu = filmcraft_gpu::export_renderer::timing::get();
+                    diag(format_args!("GPU export diagnostics: {} actual GPU composites; {} frames returned by renderer; {} CPU fallbacks",
+                        gpu.frames, renderer.frames, renderer.fallbacks));
+                    diag(format_args!("GPU timings: submit {:.3}s, readback wait {:.3}s, pixel conversion {:.3}s",
+                        gpu.submit.as_secs_f64(), gpu.map_wait.as_secs_f64(), gpu.convert.as_secs_f64()));
                     diag(format_args!("exported {written} in {:.1}s", t0.elapsed().as_secs_f64()));
                 }
                 Err(e) => fail(format!("export: {e}")),
