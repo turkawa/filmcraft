@@ -56,6 +56,7 @@ pub mod scrub;
 mod shuttle;
 pub mod source_playback;
 pub mod state;
+mod stabilizer_jobs;
 pub mod theme;
 mod theme_favorites;
 pub mod widgets;
@@ -348,6 +349,7 @@ pub struct FilmcraftApp {
     /// Files being dragged over the window from the OS (count, pointer): the Timeline previews where they would land.
     file_drag_hover: Option<(usize, egui::Pos2)>,
     timeline_view_last: Option<filmcraft_engine::project::SequenceView>,
+    pub stabilizer_revision: u64,
     pub fps: f32,
     last_time: f64,
     bindings: Vec<menus::KeyBinding>,
@@ -577,6 +579,7 @@ impl FilmcraftApp {
             pending_timeline_drop: None,
             file_drag_hover: None,
             timeline_view_last: None,
+            stabilizer_revision: 0,
             fps: 60.0,
             last_time: 0.0,
             bindings: Vec::new(),

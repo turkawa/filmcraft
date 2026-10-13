@@ -26,6 +26,7 @@ pub enum Which {
 }
 
 pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which) {
+    crate::stabilizer_jobs::poll_completed(app);
     let t = app.tokens;
     let ctx = ui.ctx().clone();
     let stacked_controls = rect.width() < 540.0;
@@ -182,7 +183,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
         let frame = rate.frame_at(time);
         let rev = match target {
             Target::Item(i) => app.item_revision(i),
-            _ => app.session.revision,
+            _ => app.session.revision ^ app.stabilizer_revision,
         };
         let size_key = (scale * 1000.0) as u32;
         let channel = display.is_channel();
@@ -196,19 +197,34 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
         let draft = crate::frames::draft_playback(playing, scale, app.session.prefs.playback.draft_decode);
         let key = FrameKey { target, frame, size: size_key, revision: rev, draft };
         let project = app.session.project.clone();
-        if playing {
+        let freeze_preview = which == Which::Program
+            && app.session.state.active_sequence.is_some_and(|seq|
+                crate::stabilizer_jobs::blocks_preview(seq, time));
+        if freeze_preview {
+            app.frames.stop_prefetch();
+        }
+        if !freeze_preview && playing {
             let preroll = which == Which::Program && app.playback.preroll.is_some();
             let speed = if which == Which::Program { app.playback.speed } else { app.source_playback.clock.speed };
             app.frames.schedule_playback(key, rate, scale, &project, speed, preroll);
             if preroll {
                 app.playback.preroll_ready = app.frames.preroll_ready(key, app.playback.speed, rate.frame_at(duration) - 1);
             }
-        } else {
+        } else if !freeze_preview {
             app.frames.request(key, rate.tick_of(frame), scale, &project, 0);
         }
-        let asked = asked_before(app, prefix, key, playing);
+        let asked = if freeze_preview { Vec::new() } else { asked_before(app, prefix, key, playing) };
         let tex_name = if channel { format!("monitor-{prefix}-{display:?}") } else { format!("monitor-{prefix}") };
-        let (shown, on_screen) = if use_gpu {
+        let (shown, on_screen) = if freeze_preview {
+            // Reuse the last uploaded texture without scheduling a new render.
+            if use_gpu {
+                (app.gpu.as_ref().and_then(|g| g.texture),
+                 app.gpu.as_ref().and_then(|g| g.last_key))
+            } else {
+                (app.texture_existing(&tex_name).map(|(id, _)| id),
+                 app.texture_key(&tex_name))
+            }
+        } else if use_gpu {
             let found = app
                 .frames
                 .get_plan(&key)
@@ -226,10 +242,10 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
         if which == Which::Program {
             app.program_shown = on_screen;
         }
-        if !playing && !exact {
+        if !freeze_preview && !playing && !exact {
             app.monitor_inexact = true;
         }
-        if playing {
+        if playing && !freeze_preview {
             let clock = if which == Which::Program { &mut app.playback } else { &mut app.source_playback.clock };
             if std::mem::take(&mut clock.hidden) {
                 clock.meter.resync(frame, exact);
@@ -244,7 +260,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
             // the reference frame (CPU path)
             let rf = rate.frame_at(Tick(mv.compare_ref.unwrap_or(time.0)));
             let rkey = FrameKey { target: cpu_target, frame: rf, size: size_key, revision: rev, draft: false };
-            app.frames.request(rkey, rate.tick_of(rf), scale, &project, 1);
+            if !freeze_preview { app.frames.request(rkey, rate.tick_of(rf), scale, &project, 1); }
             let rpic = fit(ra, display_w, frame_size.1 as f32);
             ui.painter().rect_filled(rpic, 0.0, t.monitor_bg);
             if let (Some(tex), _) = cpu_texture(app, &ctx, &format!("monitor-{prefix}-ref"), rkey, &[], DisplayMode::Composite) {
@@ -275,6 +291,16 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, which: Which)
                 DisplayMode::VideoAndWaveform => tl!("Video and Waveform"),
             };
             ui.painter().text(pos2(video_area.max.x - 8.0, video_area.min.y + 6.0), Align2::RIGHT_TOP, label, Tokens::ui(10.0), t.text_dim);
+        }
+    }
+    if which == Which::Program && show_picture {
+        if let Some(job) = crate::stabilizer_jobs::active() {
+            let banner = Rect::from_min_size(video_area.min + vec2(0.0, 5.0), vec2(video_area.width(), 25.0));
+            ui.painter().rect_filled(banner, 0.0, Color32::from_rgb(24, 83, 173));
+            let phase = job.phase();
+            ui.painter().text(banner.center(), Align2::CENTER_CENTER,
+                format!("Warp Stabilizer — Analyzing in background (step {phase} of 2)"),
+                Tokens::semibold(11.0), Color32::WHITE);
         }
     }
     // Dropped-frame indicator (Program only)

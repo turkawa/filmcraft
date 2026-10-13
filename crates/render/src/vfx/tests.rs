@@ -1008,6 +1008,7 @@ fn warp_stabilizer_removes_camera_jitter() {
     set(&mut e, "result", ParamValue::Choice(1)); // No Motion
     set(&mut e, "framing", ParamValue::Choice(0)); // Stabilize Only
     clear_stabilizer_cache();
+    assert!(stabilizer_path(&mk(0.0), 0.0, filmcraft_project::TrackMethod::PositionScaleRotation, false).is_some());
     let frames: Vec<(Image, Image)> = [3usize, 9, 15, 21]
         .iter()
         .map(|&f| {

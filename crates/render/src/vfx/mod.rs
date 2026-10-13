@@ -33,7 +33,7 @@ use crate::effects::FxCtx;
 use crate::image::Image;
 use crate::{RenderOptions, SourceProvider};
 
-pub use temporal::{StabilizerPath, clear_stabilizer_cache, stabilizer_path};
+pub use temporal::{StabilizerPath, clear_stabilizer_cache, stabilizer_path, cached_stabilizer_path, analyze_stabilizer_path, stabilizer_cache_key};
 
 /// What an effect may know about the clip beyond its own pixels.
 pub trait FxEnv: Sync {
@@ -529,4 +529,34 @@ pub fn apply(img: &mut Image, e: &EffectInstance, cx: &FxCtx) -> bool {
         _ => return false,
     }
     true
+}
+
+/// Analyse one owned project snapshot from a background thread.
+pub fn analyze_stabilizer_item(
+    project: &Project,
+    seq: &Sequence,
+    item: &TrackItem,
+    sources: &dyn SourceProvider,
+    method: filmcraft_project::TrackMethod,
+    detailed: bool,
+    cancel: &std::sync::atomic::AtomicBool,
+    progress: impl Fn(u8, usize, usize) + Sync,
+) -> Option<std::sync::Arc<StabilizerPath>> {
+    let src = crate::source_size(project, item.item)?;
+    let env = ItemEnv {
+        project, seq, item, t: item.start, opts: RenderOptions::default(), sources,
+        want: 1.0, layer_size: (src.0 as usize, src.1 as usize),
+        layer_to_output: Affine::IDENTITY, tc: "",
+    };
+    analyze_stabilizer_path(&env, 0.0, method, detailed, cancel, progress)
+}
+
+/// The same identity used by ItemEnv when rendering this clip.
+pub fn stabilizer_item_key(item: &TrackItem) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for v in [item.item.0, item.start.0 as u64, item.duration.0 as u64,
+              item.source_in.0 as u64, item.speed.to_bits(), item.reverse as u64] {
+        h = (h ^ v).wrapping_mul(0x0100_0000_01b3);
+    }
+    h
 }

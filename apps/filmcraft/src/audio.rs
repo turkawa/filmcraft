@@ -26,6 +26,10 @@ pub struct CpalOut {
     played: Arc<AtomicU64>,
     health: Arc<Health>,
     watchdog: Watchdog,
+    /// Background audio recovery worker.
+    recovery_cleanup: Option<std::thread::JoinHandle<Result<(cpal::Stream, Option<Note>), String>>>,
+    /// Prevents an obsolete worker from starting or returning audio.
+    recovery_cancel: Arc<AtomicBool>,
     /// Time base for the watchdog.
     epoch: Instant,
     rate: u32,
@@ -147,6 +151,8 @@ impl CpalOut {
             played: Arc::new(AtomicU64::new(0)),
             health: Arc::new(Health::default()),
             watchdog: Watchdog::default(),
+            recovery_cleanup: None,
+            recovery_cancel: Arc::new(AtomicBool::new(false)),
             epoch: Instant::now(),
             rate: cfg.as_ref().map_or(48_000, |c| c.sample_rate().0),
             channels: cfg.as_ref().map_or(2, |c| c.channels()),
@@ -254,14 +260,86 @@ impl CpalOut {
         Ok(())
     }
 
-    /// Replace a dropped stream with a new one on the same mixer, clock and format.
+    /// Restart audio entirely off the GUI thread.
     fn restart(&mut self) -> Result<(), String> {
+        if self.recovery_cleanup.is_some() {
+            return Ok(());
+        }
+
+        let stream = self.stream.take().ok_or("nothing is playing")?;
         let fill = self.fill.clone().ok_or("nothing is playing")?;
-        let expect = (self.rate, self.channels);
-        // The old stream (and its audio thread) goes first: only one stream ever runs the mixer.
-        self.stream = None;
-        self.health.clear_errors();
-        self.open(fill, Some(expect))
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.recovery_cancel = cancel.clone();
+
+        let hw = self.hw.clone();
+        let document_rate = self.document_rate;
+        let played = self.played.clone();
+        let health = self.health.clone();
+        let rate = self.rate;
+        let channels = self.channels;
+        let fallback = self.fallback.lock()
+            .unwrap_or_else(PoisonError::into_inner).clone();
+
+        self.recovery_cleanup = Some(std::thread::spawn(move || {
+            drop(stream);
+
+            if cancel.load(Ordering::SeqCst) {
+                return Err("audio recovery cancelled".into());
+            }
+
+            let mut worker = CpalOut::new();
+            worker.hw = hw;
+            worker.document_rate = document_rate;
+            worker.played = played;
+            worker.health = health;
+            worker.rate = rate;
+            worker.channels = channels;
+            worker.fallback = Mutex::new(fallback);
+
+            worker.health.clear_errors();
+            worker.open(fill, Some((rate, channels)))?;
+
+            let replacement = worker.stream.take()
+                .ok_or("recovery opened no audio stream")?;
+
+            if cancel.load(Ordering::SeqCst) {
+                std::thread::spawn(move || drop(replacement));
+                return Err("audio recovery cancelled".into());
+            }
+
+            Ok((replacement, worker.note.take()))
+        }));
+
+        Ok(())
+    }
+
+    /// Collect completed recovery without blocking the GUI.
+    fn finish_recovery(&mut self) {
+        if !self.recovery_cleanup.as_ref().is_some_and(|job| job.is_finished()) {
+            return;
+        }
+
+        let job = self.recovery_cleanup.take().unwrap();
+
+        match job.join() {
+            Ok(Ok((stream, note))) => {
+                if self.recovery_cancel.load(Ordering::SeqCst) {
+                    std::thread::spawn(move || drop(stream));
+                    return;
+                }
+                self.stream = Some(stream);
+                self.note = note;
+                self.watchdog.reset(self.epoch.elapsed());
+            }
+            Ok(Err(e)) => {
+                log::warn!("audio recovery failed: {e}");
+                self.health.failed.store(true, Ordering::SeqCst);
+            }
+            Err(_) => {
+                log::warn!("audio recovery worker panicked");
+                self.health.failed.store(true, Ordering::SeqCst);
+            }
+        }
     }
 }
 
@@ -393,10 +471,18 @@ impl AudioOut for CpalOut {
         Ok(self.rate)
     }
     fn stop(&mut self) {
-        self.stream = None;
+        if let Some(stream) = self.stream.take() {
+            std::thread::spawn(move || drop(stream));
+        }
+        self.recovery_cancel.store(true, Ordering::SeqCst);
+        self.recovery_cleanup = None;
         self.fill = None;
     }
     fn recover(&mut self) {
+        if self.recovery_cleanup.is_some() {
+            self.finish_recovery();
+            return;
+        }
         if self.stream.is_none() || self.health.failed.load(Ordering::SeqCst) {
             return;
         }
@@ -425,7 +511,14 @@ impl AudioOut for CpalOut {
         self.channels as usize
     }
     fn played_frames(&self) -> Option<u64> {
-        self.stream.as_ref().filter(|_| !self.health.failed.load(Ordering::SeqCst)).map(|_| self.played.load(Ordering::SeqCst))
+        if self.health.failed.load(Ordering::SeqCst) {
+            return None;
+        }
+        if self.stream.is_some() || self.recovery_cleanup.is_some() {
+            Some(self.played.load(Ordering::SeqCst))
+        } else {
+            None
+        }
     }
     fn devices(&self) -> AudioDevices {
         let h = host(&self.hw.device_class);

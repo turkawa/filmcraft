@@ -237,6 +237,54 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 if !open {
                     continue;
                 }
+                if e.effect == "warp_stabilizer" && e.enabled {
+                    let method = match e.params.get("method").map(|p| &p.value) {
+                        Some(ParamValue::Choice(0)) => filmcraft_project::TrackMethod::Position,
+                        _ => filmcraft_project::TrackMethod::PositionScaleRotation,
+                    };
+                    let detailed = matches!(e.params.get("detailed").map(|p| &p.value), Some(ParamValue::Bool(true)));
+                    let clip_key = filmcraft_render::vfx::stabilizer_item_key(it);
+                if filmcraft_render::vfx::cached_stabilizer_path(clip_key, method, detailed).is_some() {
+                    let (status_rect, _) =
+                        bui.allocate_exact_size(vec2(body.width(), ROW_H), Sense::hover());
+                    bui.painter().text(
+                        pos2(status_rect.min.x + 20.0, status_rect.center().y),
+                        Align2::LEFT_CENTER,
+                        "Stabilised",
+                        Tokens::ui(12.0),
+                        egui::Color32::from_rgb(70, 200, 100),
+                    );
+                }
+                if let Some(job) = crate::stabilizer_jobs::ensure(app, it, method, detailed, bui.ctx()) {
+                    if job.running() {
+                    let (status_rect, _) =
+                            bui.allocate_exact_size(vec2(body.width(), ROW_H), Sense::hover());
+                        let (message, color) = ("Preview disabled", egui::Color32::from_rgb(230, 162, 60));
+                        bui.painter().text(
+                            pos2(status_rect.min.x + 20.0, status_rect.center().y),
+                            Align2::LEFT_CENTER,
+                            message,
+                            Tokens::ui(12.0),
+                            color,
+                        );
+                    }
+
+                        let (r, _) = bui.allocate_exact_size(vec2(body.width(), ROW_H), Sense::hover());
+                        bui.painter().text(pos2(r.min.x + 20.0, r.center().y), Align2::LEFT_CENTER,
+                            job.status(), Tokens::ui(10.0), t.text);
+                        if !job.running() && !job.success.load(std::sync::atomic::Ordering::Acquire) {
+                            let retry_rect = Rect::from_min_size(pos2(r.max.x - 64.0, r.min.y), vec2(60.0, ROW_H));
+                            if bui.put(retry_rect, egui::Button::new("Retry")).clicked() {
+                                crate::stabilizer_jobs::retry(it, method, detailed);
+                            }
+                        }
+                        if job.running() {
+                            let cancel_rect = Rect::from_min_size(pos2(r.max.x - 64.0, r.min.y), vec2(60.0, ROW_H));
+                            if bui.put(cancel_rect, egui::Button::new("Cancel")).clicked() { job.cancel(); }
+                            bui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+                        }
+                    }
+                }
                 if crate::panels::audio_fx_editor::has_editor(&e.effect) {
                     custom_setup_row(app, bui, body, &lane, clip, idx, &e.effect);
                 }

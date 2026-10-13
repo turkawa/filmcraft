@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use filmcraft_project::{EffectInstance, TrackMethod};
 use rayon::prelude::*;
@@ -229,6 +230,18 @@ pub struct StabilizerPath {
 }
 
 type PathCache = Mutex<HashMap<u64, Arc<StabilizerPath>>>;
+static CACHE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+pub fn stabilizer_cache_key(clip_key: u64, method: TrackMethod, detailed: bool) -> u64 {
+    clip_key ^ (method as u64).wrapping_mul(0x9E37) ^ (detailed as u64).wrapping_mul(0x51_7CC1)
+}
+
+/// Never starts analysis; safe to call on the preview/render path.
+pub fn cached_stabilizer_path(clip_key: u64, method: TrackMethod, detailed: bool) -> Option<Arc<StabilizerPath>> {
+    let key = stabilizer_cache_key(clip_key, method, detailed);
+    path_cache().lock().ok()?.get(&key).cloned()
+}
+
 fn path_cache() -> &'static PathCache {
     static C: OnceLock<PathCache> = OnceLock::new();
     C.get_or_init(Default::default)
@@ -236,6 +249,7 @@ fn path_cache() -> &'static PathCache {
 
 /// Forget every cached stabilizer analysis (e.g. after the media changed).
 pub fn clear_stabilizer_cache() {
+    CACHE_EPOCH.fetch_add(1, Ordering::AcqRel);
     if let Ok(mut c) = path_cache().lock() {
         c.clear();
     }
@@ -243,42 +257,69 @@ pub fn clear_stabilizer_cache() {
 
 /// Analyse (or fetch the cached analysis of) the clip `env` describes.
 pub fn stabilizer_path(env: &dyn FxEnv, now: f64, method: TrackMethod, detailed: bool) -> Option<Arc<StabilizerPath>> {
-    let key = env.clip_key() ^ (method as u64).wrapping_mul(0x9E37) ^ (detailed as u64).wrapping_mul(0x51_7CC1);
-    if let Some(p) = path_cache().lock().ok().and_then(|c| c.get(&key).cloned()) {
-        return Some(p);
-    }
+    analyze_stabilizer_path(env, now, method, detailed, &AtomicBool::new(false), |_, _, _| {})
+}
+
+/// Background-capable analysis. Progress is (phase 1=decode, 2=track, completed, total).
+/// Cancellation never publishes a partial path.
+pub fn analyze_stabilizer_path(
+    env: &dyn FxEnv,
+    now: f64,
+    method: TrackMethod,
+    detailed: bool,
+    cancel: &AtomicBool,
+    progress: impl Fn(u8, usize, usize) + Sync,
+) -> Option<Arc<StabilizerPath>> {
+    let key = stabilizer_cache_key(env.clip_key(), method, detailed);
+    if let Some(p) = cached_stabilizer_path(env.clip_key(), method, detailed) { return Some(p); }
+    let epoch = CACHE_EPOCH.load(Ordering::Acquire);
+    let stopped = || cancel.load(Ordering::Relaxed) || filmcraft_media::cancel::cancelled()
+        || CACHE_EPOCH.load(Ordering::Acquire) != epoch;
     let fps = env.frame_rate().max(1.0);
     let n = ((env.clip_seconds() * fps).round() as usize).clamp(1, 20_000);
     let src_w = env.source_size().0.max(1) as f32;
     let target_w = if detailed { 960.0 } else { 480.0 };
     let scale = (target_w / src_w).min(1.0);
+    let completed = std::sync::atomic::AtomicUsize::new(0);
+    progress(1, 0, n);
     let frames: Vec<Option<Prepared>> = (0..n)
         .into_par_iter()
         .map(|k| {
-            if filmcraft_media::cancel::cancelled() {
-                return None;
-            }
-            env.source_frame(k as f64 / fps - now, scale).map(|f| Prepared::new(gray_of(&f)))
+            let frame = if stopped() { None } else {
+                env.source_frame(k as f64 / fps - now, scale).map(|f| Prepared::new(gray_of(&f)))
+            };
+            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            if done % 16 == 0 || done == n { progress(1, done, n); }
+            frame
         })
         .collect();
-    if filmcraft_media::cancel::cancelled() {
-        return None;
-    }
+    if stopped() { return None; }
     let (w, h) = frames.iter().flatten().next().map(|p| (p.base().w, p.base().h))?;
     let m = 8.0;
     let region = [Vec2::new(m, m), Vec2::new(w as f64 - m, m), Vec2::new(w as f64 - m, h as f64 - m), Vec2::new(m, h as f64 - m)];
-    let steps: Vec<Affine> = (0..n.saturating_sub(1))
+    let total = n.saturating_sub(1);
+    completed.store(0, Ordering::Relaxed);
+    progress(2, 0, total);
+    let steps: Vec<Affine> = (0..total)
         .into_par_iter()
-        .map(|k| match (&frames[k], &frames[k + 1]) {
-            (Some(a), Some(b)) if a.base().w == b.base().w => track_step(a, b, &region, method).map(|s| s.transform).unwrap_or(Affine::IDENTITY),
-            _ => Affine::IDENTITY,
+        .map(|k| {
+            let step = if stopped() { Affine::IDENTITY } else {
+                match (&frames[k], &frames[k + 1]) {
+                    (Some(a), Some(b)) if a.base().w == b.base().w =>
+                        track_step(a, b, &region, method).map(|s| s.transform).unwrap_or(Affine::IDENTITY),
+                    _ => Affine::IDENTITY,
+                }
+            };
+            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+            if done % 16 == 0 || done == total { progress(2, done, total); }
+            step
         })
         .collect();
+    if stopped() { return None; }
     let path = Arc::new(StabilizerPath { w, h, steps, fps });
     if let Ok(mut c) = path_cache().lock() {
-        if c.len() > 64 {
-            c.clear();
-        }
+        if stopped() { return None; }
+        if c.len() > 64 { c.clear(); }
         c.insert(key, path.clone());
     }
     Some(path)
@@ -383,7 +424,7 @@ pub(crate) fn cover_scale(corr: &Affine, w: f64, h: f64, max: f64) -> f64 {
 pub fn warp_stabilizer(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
     let Some(env) = cx.env else { return };
     let method = if chv(e, "method") == 0 { TrackMethod::Position } else { TrackMethod::PositionScaleRotation };
-    let Some(path) = stabilizer_path(env, cx.seconds, method, bv(e, "detailed")) else { return };
+    let Some(path) = cached_stabilizer_path(env.clip_key(), method, bv(e, "detailed")) else { return };
     let n = path.steps.len() + 1;
     let k = ((cx.seconds * path.fps).round().max(0.0) as usize).min(n - 1);
     let smooth = fv(e, "smoothness", cx) as f64 / 100.0 * path.fps;
